@@ -98,7 +98,6 @@ jobs:
 
           rm -rf "$SOURCE_DIR"
 
-          echo "Cloning source metadata only..."
           git clone \
             --depth=1 \
             --single-branch \
@@ -110,7 +109,6 @@ jobs:
 
           cd "$SOURCE_DIR"
 
-          echo "Preparing source file list..."
           git ls-tree -r --name-only HEAD > /tmp/source-files.txt
 
           echo "Source files:"
@@ -151,9 +149,6 @@ jobs:
             git diff --cached --stat || true
 
             git commit -m "Import fogorow dump batch"
-
-            echo "Uploading Git LFS objects for this batch..."
-            git lfs push origin "HEAD"
 
             echo "Pushing branch progress..."
             git push --progress origin "HEAD:${{ inputs.target_branch }}"
