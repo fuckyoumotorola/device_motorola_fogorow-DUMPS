@@ -1,0 +1,114 @@
+name: Import fogorow dump
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Source Git repo"
+        required: true
+        default: "https://www.gitgud.io/okbuddygsi-dumps/motorola/fogorow.git"
+      target_branch:
+        description: "Branch where files will be uploaded"
+        required: true
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-fogorow-dump
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: true
+
+      - name: Install tools
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y git-lfs rsync
+          git lfs install
+
+      - name: Download source repo
+        run: |
+          set -e
+
+          rm -rf /tmp/fogorow-source
+
+          git clone \
+            --depth=1 \
+            --single-branch \
+            "${{ inputs.source_url }}" \
+            /tmp/fogorow-source
+
+          rm -rf /tmp/fogorow-source/.git
+
+      - name: Prepare Git LFS
+        run: |
+          set -e
+
+          git lfs install
+
+          git lfs track "*.img"
+          git lfs track "*.bin"
+          git lfs track "*.br"
+          git lfs track "*.dat"
+          git lfs track "*.new.dat"
+          git lfs track "*.transfer.list"
+          git lfs track "*.map"
+          git lfs track "*.apk"
+          git lfs track "*.apex"
+          git lfs track "*.so"
+          git lfs track "*.ko"
+          git lfs track "*.zip"
+          git lfs track "*.7z"
+          git lfs track "*.tar"
+          git lfs track "*.gz"
+          git lfs track "*.xz"
+          git lfs track "*.zst"
+
+          cd /tmp/fogorow-source
+
+          while IFS= read -r -d '' file; do
+            rel="${file#./}"
+            cd "${GITHUB_WORKSPACE}"
+            git lfs track --filename "$rel"
+            cd /tmp/fogorow-source
+          done < <(find . -type f -size +95M -print0)
+
+      - name: Copy files into target repo
+        run: |
+          set -e
+
+          rsync -a --delete \
+            --exclude ".git" \
+            --exclude ".github/workflows/import-fogorow-dump.yml" \
+            /tmp/fogorow-source/ \
+            "${GITHUB_WORKSPACE}/"
+
+      - name: Commit and push
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .gitattributes .
+          
+          if git diff --cached --quiet; then
+            echo "No changes to upload."
+            exit 0
+          fi
+
+          git commit -m "Import fogorow dump"
+          git push origin "HEAD:${{ inputs.target_branch }}"
