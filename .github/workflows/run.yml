@@ -23,41 +23,73 @@ jobs:
   import:
     runs-on: ubuntu-latest
 
+    env:
+      SOURCE_DIR: /tmp/fogorow-source
+      GIT_PROGRESS_DELAY: 1
+      GIT_TRACE_PERFORMANCE: 1
+      GIT_LFS_SKIP_SMUDGE: 1
+
     steps:
       - name: Checkout target repo
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.target_branch }}
           fetch-depth: 1
-          lfs: true
+          lfs: false
           persist-credentials: true
 
       - name: Install tools
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y git-lfs rsync
+
           git lfs install
+          git config --global lfs.concurrenttransfers 16
+          git config --global lfs.activitytimeout 120
+          git config --global lfs.dialtimeout 120
+          git config --global advice.detachedHead false
 
-      - name: Download source repo
+      - name: Download source repo with progress
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf /tmp/fogorow-source
+          rm -rf "$SOURCE_DIR"
 
+          echo "Cloning source repository..."
           git clone \
             --depth=1 \
             --single-branch \
+            --progress \
             "${{ inputs.source_url }}" \
-            /tmp/fogorow-source
+            "$SOURCE_DIR"
 
-          rm -rf /tmp/fogorow-source/.git
+          cd "$SOURCE_DIR"
 
-      - name: Prepare Git LFS
+          if git lfs ls-files | grep -q .; then
+            echo "Downloading Git LFS files from source..."
+            git lfs pull --include="*" --exclude=""
+          else
+            echo "No Git LFS files detected in source."
+          fi
+
+          echo "Source size:"
+          du -sh "$SOURCE_DIR"
+
+          echo "Source file count:"
+          find "$SOURCE_DIR" -type f | wc -l
+
+          rm -rf "$SOURCE_DIR/.git"
+
+      - name: Prepare Git LFS rules
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          git lfs install
+          git lfs install --local
 
           git lfs track "*.img"
           git lfs track "*.bin"
@@ -77,32 +109,51 @@ jobs:
           git lfs track "*.xz"
           git lfs track "*.zst"
 
-          cd /tmp/fogorow-source
+          echo "Tracking every file bigger than 95 MB individually..."
+          cd "$SOURCE_DIR"
 
           while IFS= read -r -d '' file; do
             rel="${file#./}"
-            cd "${GITHUB_WORKSPACE}"
+            echo "LFS: $rel"
+            cd "$GITHUB_WORKSPACE"
             git lfs track --filename "$rel"
-            cd /tmp/fogorow-source
+            cd "$SOURCE_DIR"
           done < <(find . -type f -size +95M -print0)
 
-      - name: Copy files into target repo
-        run: |
-          set -e
+          cd "$GITHUB_WORKSPACE"
 
-          rsync -a --delete \
+          echo "Current LFS rules:"
+          cat .gitattributes || true
+
+      - name: Copy files into target repo with progress
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Copying files..."
+          rsync -a --delete --human-readable --info=progress2,stats2 \
             --exclude ".git" \
             --exclude ".github/workflows/import-fogorow-dump.yml" \
-            /tmp/fogorow-source/ \
-            "${GITHUB_WORKSPACE}/"
+            "$SOURCE_DIR/" \
+            "$GITHUB_WORKSPACE/"
 
-      - name: Commit and push
+          echo "Target size:"
+          du -sh "$GITHUB_WORKSPACE"
+
+          echo "Target file count:"
+          find "$GITHUB_WORKSPACE" -type f \
+            -not -path "$GITHUB_WORKSPACE/.git/*" \
+            | wc -l
+
+      - name: Commit and push with LFS progress
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          echo "Adding files..."
           git add .gitattributes .
           
           if git diff --cached --quiet; then
@@ -110,5 +161,14 @@ jobs:
             exit 0
           fi
 
+          echo "Files staged:"
+          git diff --cached --stat
+
+          echo "Committing..."
           git commit -m "Import fogorow dump"
-          git push origin "HEAD:${{ inputs.target_branch }}"
+
+          echo "Uploading Git LFS objects..."
+          git lfs push --all origin "HEAD"
+
+          echo "Pushing branch..."
+          git push --progress origin "HEAD:${{ inputs.target_branch }}"
