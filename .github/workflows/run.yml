@@ -1,4 +1,4 @@
-name: Import fogorow dump
+name: Import fogorow dump resumable
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "Branch where files will be uploaded"
         required: true
         default: "main"
+      max_minutes:
+        description: "Stop safely after this many minutes"
+        required: true
+        default: "170"
 
 permissions:
   contents: write
@@ -22,6 +26,7 @@ concurrency:
 jobs:
   import:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     env:
       SOURCE_DIR: /tmp/fogorow-source
@@ -44,7 +49,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y git-lfs rsync
+          sudo apt-get install -y git-lfs rsync coreutils
 
           git lfs install
           git config --global lfs.concurrenttransfers 16
@@ -52,39 +57,7 @@ jobs:
           git config --global lfs.dialtimeout 120
           git config --global advice.detachedHead false
 
-      - name: Download source repo with progress
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf "$SOURCE_DIR"
-
-          echo "Cloning source repository..."
-          git clone \
-            --depth=1 \
-            --single-branch \
-            --progress \
-            "${{ inputs.source_url }}" \
-            "$SOURCE_DIR"
-
-          cd "$SOURCE_DIR"
-
-          if git lfs ls-files | grep -q .; then
-            echo "Downloading Git LFS files from source..."
-            git lfs pull --include="*" --exclude=""
-          else
-            echo "No Git LFS files detected in source."
-          fi
-
-          echo "Source size:"
-          du -sh "$SOURCE_DIR"
-
-          echo "Source file count:"
-          find "$SOURCE_DIR" -type f | wc -l
-
-          rm -rf "$SOURCE_DIR/.git"
-
-      - name: Prepare Git LFS rules
+      - name: Prepare target Git LFS
         shell: bash
         run: |
           set -euo pipefail
@@ -109,66 +82,145 @@ jobs:
           git lfs track "*.xz"
           git lfs track "*.zst"
 
-          echo "Tracking every file bigger than 95 MB individually..."
+          git add .gitattributes
+
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Prepare Git LFS rules"
+            git push --progress origin "HEAD:${{ inputs.target_branch }}"
+          fi
+
+      - name: Clone source metadata only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$SOURCE_DIR"
+
+          echo "Cloning source metadata only..."
+          git clone \
+            --depth=1 \
+            --single-branch \
+            --filter=blob:none \
+            --no-checkout \
+            --progress \
+            "${{ inputs.source_url }}" \
+            "$SOURCE_DIR"
+
           cd "$SOURCE_DIR"
 
-          while IFS= read -r -d '' file; do
-            rel="${file#./}"
-            echo "LFS: $rel"
-            cd "$GITHUB_WORKSPACE"
-            git lfs track --filename "$rel"
-            cd "$SOURCE_DIR"
-          done < <(find . -type f -size +95M -print0)
+          echo "Preparing source file list..."
+          git ls-tree -r --name-only HEAD > /tmp/source-files.txt
 
-          cd "$GITHUB_WORKSPACE"
+          echo "Source files:"
+          wc -l /tmp/source-files.txt
 
-          echo "Current LFS rules:"
-          cat .gitattributes || true
-
-      - name: Copy files into target repo with progress
+      - name: Import files in resumable batches
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Copying files..."
-          rsync -a --delete --human-readable --info=progress2,stats2 \
-            --exclude ".git" \
-            --exclude ".github/workflows/import-fogorow-dump.yml" \
-            "$SOURCE_DIR/" \
-            "$GITHUB_WORKSPACE/"
-
-          echo "Target size:"
-          du -sh "$GITHUB_WORKSPACE"
-
-          echo "Target file count:"
-          find "$GITHUB_WORKSPACE" -type f \
-            -not -path "$GITHUB_WORKSPACE/.git/*" \
-            | wc -l
-
-      - name: Commit and push with LFS progress
-        shell: bash
-        run: |
-          set -euo pipefail
+          START_TIME="$(date +%s)"
+          MAX_SECONDS="$(( ${{ inputs.max_minutes }} * 60 ))"
+          SAFETY_SECONDS=300
+          BATCH_FILE_LIMIT=250
+          BATCH_BYTE_LIMIT="$(( 900 * 1024 * 1024 ))"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          echo "Adding files..."
-          git add .gitattributes .
-          
-          if git diff --cached --quiet; then
-            echo "No changes to upload."
-            exit 0
-          fi
+          should_stop() {
+            now="$(date +%s)"
+            elapsed="$(( now - START_TIME ))"
+            remaining="$(( MAX_SECONDS - elapsed ))"
 
-          echo "Files staged:"
-          git diff --cached --stat
+            if [ "$remaining" -le "$SAFETY_SECONDS" ]; then
+              return 0
+            fi
 
-          echo "Committing..."
-          git commit -m "Import fogorow dump"
+            return 1
+          }
 
-          echo "Uploading Git LFS objects..."
-          git lfs push --all origin "HEAD"
+          push_batch() {
+            if git diff --cached --quiet; then
+              return 0
+            fi
 
-          echo "Pushing branch..."
-          git push --progress origin "HEAD:${{ inputs.target_branch }}"
+            echo "Committing current batch..."
+            git diff --cached --stat || true
+
+            git commit -m "Import fogorow dump batch"
+
+            echo "Uploading Git LFS objects for this batch..."
+            git lfs push origin "HEAD"
+
+            echo "Pushing branch progress..."
+            git push --progress origin "HEAD:${{ inputs.target_branch }}"
+          }
+
+          cd "$SOURCE_DIR"
+
+          TOTAL_FILES="$(wc -l < /tmp/source-files.txt)"
+          DONE_FILES=0
+          COPIED_IN_BATCH=0
+          BYTES_IN_BATCH=0
+
+          while IFS= read -r rel; do
+            DONE_FILES="$(( DONE_FILES + 1 ))"
+
+            case "$rel" in
+              .git/*|.github/workflows/import-fogorow-dump.yml)
+                echo "Skipping protected file: $rel"
+                continue
+                ;;
+            esac
+
+            source_size="$(git cat-file -s "HEAD:$rel" 2>/dev/null || echo 0)"
+
+            if [ -f "$GITHUB_WORKSPACE/$rel" ]; then
+              target_size="$(wc -c < "$GITHUB_WORKSPACE/$rel" || echo 0)"
+              if [ "$source_size" = "$target_size" ]; then
+                echo "[$DONE_FILES/$TOTAL_FILES] Already imported: $rel"
+                continue
+              fi
+            fi
+
+            if should_stop; then
+              echo "Time limit is near. Saving current progress before stopping..."
+              cd "$GITHUB_WORKSPACE"
+              push_batch
+              echo "Stopped safely. Run the workflow again to continue."
+              exit 0
+            fi
+
+            echo "[$DONE_FILES/$TOTAL_FILES] Downloading: $rel"
+            mkdir -p "$GITHUB_WORKSPACE/$(dirname "$rel")"
+
+            git cat-file blob "HEAD:$rel" > "$GITHUB_WORKSPACE/$rel"
+
+            cd "$GITHUB_WORKSPACE"
+
+            git add .gitattributes "$rel"
+
+            COPIED_IN_BATCH="$(( COPIED_IN_BATCH + 1 ))"
+            BYTES_IN_BATCH="$(( BYTES_IN_BATCH + source_size ))"
+
+            echo "Imported size this batch: $(( BYTES_IN_BATCH / 1024 / 1024 )) MiB"
+            echo "Files this batch: $COPIED_IN_BATCH"
+
+            if [ "$COPIED_IN_BATCH" -ge "$BATCH_FILE_LIMIT" ] || [ "$BYTES_IN_BATCH" -ge "$BATCH_BYTE_LIMIT" ]; then
+              push_batch
+              COPIED_IN_BATCH=0
+              BYTES_IN_BATCH=0
+            fi
+
+            cd "$SOURCE_DIR"
+          done < /tmp/source-files.txt
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "Pushing final batch..."
+          push_batch
+
+          echo "Import finished."
